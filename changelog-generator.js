@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+// @ts-check
 "use strict";
 
 const levenshtein = require("fast-levenshtein");
@@ -381,11 +382,44 @@ ${data.unknown.ios.join("\n")}
 `;
 }
 
-fetchJSON(
-  "api.github.com",
-  "/repos/facebook/react-native/compare/" + base + "..." + compare
-)
-  .then(data => data.commits)
+const COMMIT_COUNT_PER_PAGE = 250;
+
+function fetchDiffPage(page) {
+  return fetchJSON(
+    "api.github.com",
+    `/repos/facebook/react-native/compare/${base}...${compare}?per_page=${COMMIT_COUNT_PER_PAGE}&page=${page}`
+  );
+}
+
+function fetchCommits() {
+  return new Promise((resolve, reject) => {
+    let page = 0;
+    let commits = [];
+    const fetchPage = () => {
+      fetchDiffPage(page++)
+        .then(data => {
+          commits = commits.concat(data.commits)
+          if (data.commits.length === COMMIT_COUNT_PER_PAGE) {
+            setImmediate(fetchPage);
+          } else {
+            resolve(commits);
+          }
+        })
+        .catch(reject);
+    };
+    fetchPage();
+  });
+}
+
+// fetchJSON(
+//   "api.github.com",
+//   "/repos/facebook/react-native/compare/" + base + "..." + compare
+// )
+//   .then(data => {
+//     console.log(`Total commit count ${data.commits.length}`);
+//     return data.commits
+//   })
+fetchCommits()
   .then(filterCICommits)
   .then(filterRevertCommits)
   .then(getChangelogDesc)
