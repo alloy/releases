@@ -16,7 +16,13 @@ const execFile = util.promisify(require('child_process').execFile);
 const path = require("path");
 const fs = require("fs");
 
-function fetchJSON(host, path) {
+/**
+ * @param {string} token 
+ * @param {string} path 
+ */
+function fetchJSON(token, path) {
+  const host = "api.github.com";
+  console.log(`[GET] https://${host}${path}`);
   return new Promise((resolve, reject) => {
     let data = "";
 
@@ -25,18 +31,22 @@ function fetchJSON(host, path) {
         host,
         path,
         headers: {
+          "Authorization": `token ${token}`,
           "User-Agent": "Mozilla/4.0 (compatible; MSIE 7.0; Windows NT 6.0)"
         }
       })
       .on("response", response => {
+        if (response.statusCode !== 200) {
+          return reject(new Error(`[!] Got HTTP status: ${response.statusCode}`));
+        }
+
         response.on("data", chunk => {
           data += chunk;
         });
 
         response.on("end", () => {
           try {
-            const json = JSON.parse(data);
-            resolve(json);
+            resolve({ json: JSON.parse(data), headers: response.headers });
           } catch (e) {
             reject(e);
           }
@@ -49,6 +59,43 @@ function fetchJSON(host, path) {
   });
 }
 
+/**
+ * @param {string} token
+ * @param {string} base
+ * @param {string} compare
+ * @returns {Promise<Commit[]>}
+ */
+function fetchCommits(token, base, compare) {
+  const commits = [];
+  let page = 1;
+  return new Promise((resolve, reject) => {
+    const fetchPage = () => {
+      fetchJSON(token, `/repos/facebook/react-native/commits?sha=${compare}&page=${page++}`)
+        .then(({ json, headers }) => {
+          /**
+           * @type {Commit[]}
+           */
+          const pageCommits = json;
+          for (const commit of pageCommits) {
+            commits.push(commit);
+            if (commit.sha === base) {
+              return resolve(commits);
+            }
+          }
+          if (!headers.link.includes("next")) {
+            throw new Error("Did not find commit after paging through all commits");
+          }
+          setImmediate(fetchPage);
+        })
+        .catch(reject);
+    }
+    fetchPage();
+  });
+}
+
+/**
+ * @param {Commit[]} commits 
+ */
 function filterCICommits(commits) {
   return commits.filter(item => {
     const text = item.commit.message.toLowerCase();
@@ -62,6 +109,9 @@ function filterCICommits(commits) {
   });
 }
 
+/**
+ * @param {Commit[]} commits 
+ */
 function filterRevertCommits(commits) {
   let revertCommits = [];
   const pattern = /\b(revert d\d{8}: |revert\b|back out ".*")/i
@@ -99,7 +149,13 @@ function filterRevertCommits(commits) {
  */
 function filterPreviouslyPickedCommits(existingChangelogData, commits) {
   // TODO: Perhaps it's more performant to first parse all commit SHAs out of the existing changelog data.
-  return commits.filter(({ sha }) => !existingChangelogData.includes(sha.slice(0, 7)));
+  return commits.filter(({ sha }) => {
+    if (existingChangelogData.includes(sha.slice(0, 7))) {
+      console.warn(`Ignoring previously picked commit: ${sha}`);
+      return false;
+    }
+    return true;
+  });
 }
 
 /**
@@ -129,6 +185,21 @@ function getOriginalCommit(gitDir, item) {
  */
 function getOriginalCommits(gitDir, commits) {
   return Promise.all(commits.map(c => getOriginalCommit(gitDir, c)));
+}
+
+/**
+ * @param {string} gitDir
+ * @param {string} ref
+ */
+function getFirstCommitAfterForkingFromMaster(gitDir, ref) {
+  return execFile("git", [`--git-dir=${gitDir}`, "rev-list", `^${ref}`, "--first-parent", "master"])
+    .then(out => {
+      if (out.stderr) {
+        throw new Error(out.stderr);
+      }
+      const components = out.stdout.trimRight().split("\n");
+      return components[components.length - 1];
+    });
 }
 
 function isAndroidCommit(change) {
@@ -209,6 +280,10 @@ function getChangeMessage(item) {
   return `- ${entry} ${authorSection}`;
 }
 
+/**
+ * @param {Commit[]} commits
+ * @param {boolean} verbose
+ */
 function getChangelogDesc(commits, verbose) {
   const acc = {
     breaking: { android: [], ios: [], general: [] },
@@ -406,6 +481,7 @@ ${data.unknown.ios.join("\n")}
 
 /**
  * @param {Object} options
+ * @param {string} options.token
  * @param {string} options.base
  * @param {string} options.compare
  * @param {string} options.gitDir
@@ -413,11 +489,7 @@ ${data.unknown.ios.join("\n")}
  * @param {boolean=} options.verbose
  */
 function generateChangelog(options) {
-  return fetchJSON(
-    "api.github.com",
-    "/repos/facebook/react-native/compare/" + options.base + "..." + options.compare
-  )
-    .then(data => data.commits)
+  return fetchCommits(options.token, options.base, options.compare)
     .then(filterCICommits)
     .then(filterRevertCommits)
     .then(commits => getOriginalCommits(options.gitDir, commits))
@@ -426,7 +498,7 @@ function generateChangelog(options) {
     .then(changes => buildMarkDown(options.compare, changes));
 }
 
-module.exports = { generateChangelog, getChangeMessage, getOriginalCommit };
+module.exports = { fetchCommits, generateChangelog, getChangeMessage, getOriginalCommit, getFirstCommitAfterForkingFromMaster };
 
 if (!module["parent"]) {
   const argv = require("yargs")
@@ -439,14 +511,14 @@ if (!module["parent"]) {
         alias: "b",
         string: true,
         describe:
-          "the base version branch or commit to compare against (most often, this is the current stable)",
+          "the base branch/tag/commit to compare against (most likely the previous stable version)",
         demandOption: true
       },
       compare: {
         alias: "c",
         string: true,
         describe:
-          "the new version branch or commit (most often, this is the release candidate)",
+          "the new version branch/tag/commit (most likely the latest release candidate)",
         demandOption: true
       },
       repo: {
@@ -459,6 +531,12 @@ if (!module["parent"]) {
         alias: "f",
         string: true,
         describe: "the path to the existing CHANGELOG.md file",
+        demandOption: true,
+      },
+      token: {
+        alias: "t",
+        string: true,
+        describe: "A GitHub token",
         demandOption: true,
       },
       verbose: {
@@ -475,7 +553,10 @@ if (!module["parent"]) {
   const gitDir = path.join(argv.repo, ".git");
   const existingChangelogData = fs.readFileSync(argv.changelog, "utf-8");
 
-  generateChangelog({ ...argv, gitDir, existingChangelogData })
+  // TODO: When base and compare have the same first commit, then it's probably a patch release and so we should
+  //       not use the first commit.
+  getFirstCommitAfterForkingFromMaster(gitDir, argv.base)
+    .then(base => generateChangelog({ ...argv, base, gitDir, existingChangelogData }))
     .then(data => console.log(data))
     .catch(e => console.error(e));
 }
